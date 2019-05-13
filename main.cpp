@@ -1229,6 +1229,30 @@ void cartesianToGeodetic(double x, double y, double z, double &lon, double &lat,
   lat *= 180.0 / M_PI;
 }
 
+double deg2rad(double deg) 
+{
+  return (deg * M_PI / 180);
+}
+
+//  This function converts radians to decimal degrees
+double rad2deg(double rad) 
+{
+  return (rad * 180 / M_PI);
+}
+
+double haversDist(double lat1d, double lon1d, double lat2d, double lon2d) 
+{
+  double lat1r, lon1r, lat2r, lon2r, u, v;
+  lat1r = deg2rad(lat1d);
+  lon1r = deg2rad(lon1d);
+  lat2r = deg2rad(lat2d);
+  lon2r = deg2rad(lon2d);
+  u = sin((lat2r - lat1r)/2);
+  v = sin((lon2r - lon1r)/2);
+  const double earthRadiusKm = 6371.0;
+  return 2.0 * earthRadiusKm * asin(sqrt(u * u + cos(lat1r) * cos(lat2r) * v * v));
+}
+
 #ifdef NMAIN
 bool COMMUNICATION_VIA_FILES = true;
 
@@ -1322,6 +1346,11 @@ struct navline_t {
   double frecv;
 };
 
+double getNavDist(const navline_t &lhs, const navline_t &rhs)
+{
+  return sqrt(SQR(lhs.x - rhs.x) + SQR(lhs.y - rhs.y) + SQR(lhs.z - rhs.z));
+}
+
 class GeolocatorBase {
 public:
   void onNewChunk(double fEmitted, double totalLag, const string &name);
@@ -1351,6 +1380,7 @@ void GeolocatorBase::onNewChunk(double fEmitted, double totalLag, const string &
   {
     ifstream in;
     in.open((name + ".raw").c_str(), ios::binary);   // reading the receiver raw file
+    assert(!in.bad() && !in.eof());
     int N = (int)IQ_SIZE_SEC * NSAMPLES_PER_SEC * 2;
     m_iqData.resize(N);
     in.read((char *)&m_iqData[0], N * sizeof(short));
@@ -1368,7 +1398,7 @@ void GeolocatorBase::onNewChunk(double fEmitted, double totalLag, const string &
       vector <string> items = split(line, ',');
 
       navline_t navline;
-      int timeNav = atoi(items[3].substr(0, 6).c_str());
+      int timeNav = atoi(items[3].substr(0, 2).c_str()) * 3600 + atoi(items[3].substr(2, 2).c_str()) * 60 + atoi(items[3].substr(4, 2).c_str());
 
       vector <string> latString = split(items[4], ':');
       vector <string> lonString = split(items[5], ':');
@@ -1391,7 +1421,8 @@ void GeolocatorBase::onNewChunk(double fEmitted, double totalLag, const string &
       navline.pitch = atof(items[11].c_str()) * DEG2RAD;
       navline.speed = atof(items[10].c_str()) * KNOT2MS;
 
-      geodeticToCartesian(navline.lon, navline.lat, navline.h, navline.x, navline.y, navline.z);
+      //geodeticToCartesian(navline.lon, navline.lat, navline.h, navline.x, navline.y, navline.z);
+      geodeticToCartesian(navline.lon, navline.lat, 0, navline.x, navline.y, navline.z);
 
       m_navlineArr.push_back(navline);
     }
@@ -1432,7 +1463,8 @@ void GeolocatorBase::onNewChunk(double fEmitted, double totalLag, const string &
         val.pitch /= cntArr[j];
         val.speed /= cntArr[j];
 
-        geodeticToCartesian(val.lon, val.lat, val.h, val.x, val.y, val.z);
+        //geodeticToCartesian(val.lon, val.lat, val.h, val.x, val.y, val.z);
+        geodeticToCartesian(val.lon, val.lat, 0, val.x, val.y, val.z);
 
         navlineCopy.push_back(val);
 
@@ -1461,6 +1493,17 @@ private:
   vector<navline_t> m_navlineComb;
 };
 
+class GeolocatorLSGSearch: public GeolocatorBase {
+public:
+  void onChunkReady() override;
+
+private:
+  void calculateFRecv();
+
+private:
+  vector<navline_t> m_navlineComb;
+};
+
 void GeolocatorLS::calculateFRecv()
 {
   assert(!m_navlineArr.empty());
@@ -1477,6 +1520,9 @@ void GeolocatorLS::calculateFRecv()
     }
     int sz = toIdx - fromIdx;
     int sz2 = clp2(sz);
+    if (i != m_navlineArr.size() - 1) {
+      sz = sz2;
+    }
     WrapVecDoub vec(2*sz2);
     for (int j = 0; j < sz2; ++j) {
       if (j < sz) {
@@ -1490,6 +1536,11 @@ void GeolocatorLS::calculateFRecv()
     double maxAmp = 0.0;
     double maxAmpFreq = 0.0; // hz
     double maxIdx = 0;
+
+    //char buf[128];
+    //sprintf(buf, "%d.out", i);
+    //FILE *fd = fopen(buf, "w");
+    //fprintf(fd, "idx,freq\n");
     for (int j = -sz2/2; j <sz2/2; ++j) {
       double amp = log(std::abs(vec[j]));
       if (amp > maxAmp) {
@@ -1503,15 +1554,173 @@ void GeolocatorLS::calculateFRecv()
 
         maxIdx = j;
       }
+      //fprintf(fd, "%d,%f\n", j, amp);
     }
+    //fclose(fd);
 
     nv.frecv = -maxAmpFreq;
   }
 }
 
+void GeolocatorLSGSearch::calculateFRecv()
+{
+  assert(!m_navlineArr.empty());
+
+  double stime = m_navlineArr.front().time;
+  for (int i = 0; i < m_navlineArr.size(); ++i) {
+    navline_t &nv = m_navlineArr[i];
+    int fromIdx = (nv.time - stime) * NSAMPLES_PER_SEC;
+    //int fromIdx = floor(nv.time - stime) * NSAMPLES_PER_SEC;
+    int toIdx = NSAMPLES_PER_SEC * IQ_SIZE_SEC;
+    if (i != m_navlineArr.size() - 1) {
+      toIdx = (m_navlineArr[i + 1].time - stime) * NSAMPLES_PER_SEC;
+      //toIdx = (ceil(m_navlineArr[i + 1].time) - stime) * NSAMPLES_PER_SEC;
+    }
+    int sz = toIdx - fromIdx;
+    int sz2 = clp2(sz);
+    if (i != m_navlineArr.size() - 1) {
+      sz = sz2;
+    }
+    WrapVecDoub vec(2*sz2);
+    for (int j = 0; j < sz2; ++j) {
+      if (j < sz) {
+        vec.real(j) = (double)m_iqData[2 * (fromIdx + j)];
+        vec.imag(j) = (double)m_iqData[2 * (fromIdx + j) + 1];
+      } else {
+        vec.real(j) = vec.imag(j) = 0.0;
+      }
+    }
+    four1((Doub*)(&vec[0]),sz2,1);
+    double maxAmp = 0.0;
+    double maxAmpFreq = 0.0; // hz
+    double maxIdx = 0;
+
+    //char buf[128];
+    //sprintf(buf, "%d.out", i);
+    //FILE *fd = fopen(buf, "w");
+    //fprintf(fd, "idx,freq\n");
+    for (int j = -sz2/2; j <sz2/2; ++j) {
+      double amp = log(std::abs(vec[j]));
+      if (amp > maxAmp) {
+        maxAmp = amp;
+
+        if (j > 0) {
+          maxAmpFreq = (double)j / sz2 * NSAMPLES_PER_SEC;
+        } else {
+          maxAmpFreq = -double(j + sz2/2) / sz2 * NSAMPLES_PER_SEC;
+        }
+
+        maxIdx = j;
+      }
+      //fprintf(fd, "%d,%f\n", j, amp);
+    }
+    //fclose(fd);
+
+    nv.frecv = -maxAmpFreq;
+  }
+}
+
+
 VecDoub smdFunc(VecDoub_I &arg) { return arg; }
 
+void GeolocatorLSGSearch::onChunkReady()
+{
+  calculateFRecv();
 
+  std::copy(m_navlineArr.begin(), m_navlineArr.end(), back_inserter(m_navlineComb));
+
+  int sz = m_navlineComb.size();
+  assert(sz > 1);
+
+  double minLat = 1e9, maxLat = -1e9, minLon = 1e9, maxLon = -1e9;
+  for (auto &v: m_navlineComb) {
+    minLat = min(minLat, v.lat);
+    maxLat = max(maxLat, v.lat);
+    minLon = min(minLon, v.lon);
+    maxLon = max(maxLon, v.lon);
+  }
+
+  vector<double> rArr(sz), xArr(sz), yArr(sz), bArr(sz), cArr(sz), dArr(sz), kArr(sz);
+
+  double wKm = haversDist(minLat, minLon, minLat, maxLon);
+  double hKm = haversDist(minLat, minLon, maxLat, minLon);
+  const double stepScale = 0.5;
+  double kmPerLat = (maxLat - minLat) / hKm;
+  double kmPerLon = (maxLon - minLon) / wKm;
+  const double kmWide = 75; //km
+  const double latLimit = kmWide * kmPerLat;
+  const double lonLimit = kmWide * kmPerLon;
+  double latCenter = (maxLat + minLat) / 2;
+  double lonCenter = (maxLon + minLon) / 2;
+  double lat0 = latCenter - latLimit;
+  double lon0 = lonCenter - lonLimit;
+  double avgSpeed = 0.0;
+
+  for (int i = 0; i < sz; ++i) {
+    auto &v = m_navlineComb[i];
+    xArr[i] = (v.lon - lon0) / (2*lonLimit) * kmWide * 2 * 1000;
+    yArr[i] = (v.lat - lat0) / (2*latLimit) * kmWide * 2 * 1000;
+    avgSpeed += v.speed;
+  }
+
+  avgSpeed /= sz;
+
+  MatDoub matA(sz, 3);
+  VecDoub vecB(sz, 1.0);
+  VecDoub vecSsig(sz, 1.0);
+
+  for (int i = 0; i < sz; ++i) {
+    vecB[i] = m_fReceiver + m_navlineComb[i].frecv;
+  }
+
+  double bestChiSqr = -1.0, bestGLat = lat0, bestGLon = lon0;
+  for (double gLat = latCenter - latLimit; gLat < latCenter + latLimit; gLat += stepScale * kmPerLat) {
+    for (double gLon = lonCenter - lonLimit; gLon < lonCenter + lonLimit; gLon += stepScale * kmPerLon) {
+      double xcur = (gLon - lon0) / (2*lonLimit) * kmWide * 2 * 1000;
+      double ycur = (gLat - lat0) / (2*latLimit) * kmWide * 2 * 1000;
+
+      //if (gLat > 30.670 && gLat < 30.700 && gLon > -85.300 && gLon < -85.100) {
+      //  static volatile bool ok = true;
+      //  ok = false;
+      //}
+
+      for (int i = 0; i < sz; ++i) {
+        rArr[i] = sqrt(SQR(xArr[i] - xcur) + SQR(yArr[i] - ycur));
+      }
+
+      for (int i = 0; i < sz; ++i) {
+        matA[i][0] = (xcur - xArr[i]) / rArr[i] / SPEED_OF_LIGHT;
+        matA[i][1] = (ycur - yArr[i]) / rArr[i] / SPEED_OF_LIGHT;
+        matA[i][2] = 1;
+      }
+
+      Fitsvd lsq(matA, vecB, vecSsig, &smdFunc);
+      lsq.fit();
+
+      double femitted = lsq.a[2];
+      double xsol = lsq.a[0] / femitted;
+      double ysol = lsq.a[1] / femitted;
+
+      const double freqLimit = 500; // hz
+      if (abs(femitted - m_fEmitted) > freqLimit) {
+        continue;
+      }
+
+      double speed = sqrt(SQR(xsol) + SQR(ysol));
+      if (abs(speed - avgSpeed) > 10) {
+        continue;
+      }
+
+      if (bestChiSqr < 0 || bestChiSqr > lsq.chisq) {
+        bestChiSqr = lsq.chisq;
+        bestGLon = gLon;
+        bestGLat = gLat;
+      }
+    }
+  }
+
+  printf("err=%f,lat=%f,lon=%f\n", bestChiSqr / sz, bestGLat, bestGLon);
+}
 
 void GeolocatorLS::onChunkReady()
 {
@@ -1525,6 +1734,11 @@ void GeolocatorLS::onChunkReady()
 
   for (int i = 0; i < sz; ++i) {
     auto &v = m_navlineComb[i];
+    bArr[i] = cos(v.heading);
+    cArr[i] = sin(v.heading);
+    kArr[i] = -(bArr[i] * v.x + cArr[i] * v.y);
+    //kArr[i] = -(bArr[i] * v.lon + cArr[i] * v.lat);
+
     //bArr[i] = cos(v.heading) * cos(v.pitch);
     //cArr[i] = sin(v.heading) * cos(v.pitch);
     //dArr[i] = sin(v.pitch);
@@ -1550,7 +1764,7 @@ void GeolocatorLS::onChunkReady()
     //  dArr[i] = dArr[i-1];
     //}
 
-    kArr[i] = -(v.x * bArr[i] + v.y * cArr[i] + v.z * dArr[i]);
+    //kArr[i] = -(v.x * bArr[i] + v.y * cArr[i] + v.z * dArr[i]);
   }
 
   //double deltaFreq=  m_fEmitted * m_navlineComb.front().speed / SPEED_OF_LIGHT;
@@ -1569,7 +1783,8 @@ void GeolocatorLS::onChunkReady()
         break;
       }
       alphaArr[j] = acos(v1);
-      distArr[j] = v.speed * 1;
+      distArr[j] = j + 1 == m_navlineComb.size() ? v.speed: getNavDist(m_navlineComb[j], m_navlineComb[j + 1]);
+      //distArr[j] = v.speed * 1;
       if (j != 0) {
         distArr[j] += distArr[j - 1];
       }
@@ -1579,19 +1794,30 @@ void GeolocatorLS::onChunkReady()
       continue;
     }
 
-    rArr[0] = distArr[0] * sin(alphaArr[1]) / sin(alphaArr[1] - alphaArr[0]);
-    for (int j = 1; j < sz; ++j) {
-      rArr[j] = distArr[j - 1] * sin(alphaArr[0]) / sin(alphaArr[j] - alphaArr[0]);
+    if (alphaArr[0] < alphaArr[1]) {
+      rArr[0] = distArr[0] * sin(alphaArr[1]) / sin(alphaArr[1] - alphaArr[0]);
+      for (int j = 1; j < sz; ++j) {
+        rArr[j] = distArr[j - 1] * sin(alphaArr[0]) / sin(alphaArr[j] - alphaArr[0]);
+      }
+    } else {
+      rArr[0] = distArr[0] * cos(alphaArr[0]) / sin(alphaArr[0] - alphaArr[1]);
+      for (int j = 1; j < sz; ++j) {
+        rArr[j] = distArr[j - 1] * sin(alphaArr[0]) / sin(alphaArr[0] - alphaArr[j]);
+      }
+    }
+    
+    for (int j = 0; j < sz; ++j) {
+      rArr[j] = abs(rArr[j]);
     }
 
-    MatDoub matA(sz, 3);
+    MatDoub matA(sz, 2);
     VecDoub vecB(sz, 1.0);
     VecDoub vecSsig(sz, 1.0);
 
     for (int j = 0; j < sz; ++j) {
       matA[j][0] = bArr[j];
       matA[j][1] = cArr[j];
-      matA[j][2] = dArr[j];
+      //matA[j][2] = dArr[j];
       //char buf[1024];
       //sprintf(buf, "%f,%f,%f;",bArr[j],cArr[j],dArr[j]);
       
@@ -1603,18 +1829,18 @@ void GeolocatorLS::onChunkReady()
     Fitsvd lsq(matA, vecB, vecSsig, &smdFunc);
     lsq.fit();
 
-    double x = lsq.a[0];
-    double y = lsq.a[1];
-    double z = lsq.a[2];
-    double lon, lat, h;
-    cartesianToGeodetic(x, y, z, lon, lat, h);
+    double lon = lsq.a[0];
+    double lat = lsq.a[1];
+    //double lon, lat, h;
+    //cartesianToGeodetic(x, y, z, lon, lat, h);
 
-    printf("%f,%f,%f,%f,%f,%f\n", x, y, z, lon, lat, h);
+    printf("%f,%f\n", lon, lat);
   }
 }
 
 int main(int argc, char* argv[]){
-  GeolocatorLS geo;
+  //GeolocatorLS geo;
+  GeolocatorLSGSearch geo;
 
 #ifdef NMAIN
   Communicator com;
@@ -1625,7 +1851,7 @@ int main(int argc, char* argv[]){
   while(true){
     vector <string> message = split(trim(com.receive_line()));
     if(message.size() < 3){
-      cerr << "Incorect format of the message!" << endl;
+      cerr << "Incorrect format of the message!" << endl;
       return 1;
     }
     int f_emitter = atoi(message[0].c_str()); 
